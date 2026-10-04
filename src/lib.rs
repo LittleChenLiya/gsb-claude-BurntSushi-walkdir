@@ -110,6 +110,7 @@ for entry in walker.filter_entry(|e| !is_hidden(e)) {
 doc_comment::doctest!("../README.md");
 
 use std::cmp::{min, Ordering};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, ReadDir};
 use std::io;
@@ -124,9 +125,13 @@ pub use crate::dent::DirEntry;
 #[cfg(unix)]
 pub use crate::dent::DirEntryExt;
 pub use crate::error::Error;
+pub use crate::identity::{
+    DirId, DirIdentifier, DirIdentityPolicy, SkippedDir,
+};
 
 mod dent;
 mod error;
+mod identity;
 #[cfg(test)]
 mod tests;
 mod util;
@@ -252,6 +257,8 @@ struct WalkDirOptions {
     >,
     contents_first: bool,
     same_file_system: bool,
+    dir_identity_policy: DirIdentityPolicy,
+    dir_identifier: Option<Box<dyn DirIdentifier>>,
 }
 
 impl fmt::Debug for WalkDirOptions {
@@ -265,6 +272,12 @@ impl fmt::Debug for WalkDirOptions {
         } else {
             "None"
         };
+        let identifier_str = if self.dir_identifier.is_some() {
+            // DirIdentifier isn't `Debug`
+            "Some(...)"
+        } else {
+            "None"
+        };
         f.debug_struct("WalkDirOptions")
             .field("follow_links", &self.follow_links)
             .field("follow_root_link", &self.follow_root_links)
@@ -274,6 +287,8 @@ impl fmt::Debug for WalkDirOptions {
             .field("sorter", &sorter_str)
             .field("contents_first", &self.contents_first)
             .field("same_file_system", &self.same_file_system)
+            .field("dir_identity_policy", &self.dir_identity_policy)
+            .field("dir_identifier", &identifier_str)
             .finish()
     }
 }
@@ -297,6 +312,8 @@ impl WalkDir {
                 sorter: None,
                 contents_first: false,
                 same_file_system: false,
+                dir_identity_policy: DirIdentityPolicy::default(),
+                dir_identifier: None,
             },
             root: root.as_ref().to_path_buf(),
         }
@@ -531,6 +548,71 @@ impl WalkDir {
         self.opts.same_file_system = yes;
         self
     }
+
+    /// Set the policy used to avoid revisiting directories.
+    ///
+    /// The default policy is [`DirIdentityPolicy::AncestorsOnly`], which
+    /// preserves the standard behavior of this iterator: when symbolic
+    /// links are followed, a directory that loops back to one of its
+    /// ancestors is reported as an error and is not descended into, but
+    /// the same directory reached through different branches of the tree
+    /// (e.g. via symlinks) may be visited more than once.
+    ///
+    /// [`DirIdentityPolicy::OncePerScan`] additionally guarantees that
+    /// each distinct directory is descended into at most once for the
+    /// entire scan. Directories skipped this way are reported through
+    /// [`IntoIter::skipped_dirs`].
+    ///
+    /// Directory identity is determined by the underlying file system
+    /// (device and inode number, or the equivalent on other platforms)
+    /// rather than by the displayed path, so aliased paths that refer to
+    /// the same directory are recognized as such. A custom identity
+    /// provider can be installed with [`dir_identifier`].
+    ///
+    /// Note that setting a non-default policy (or installing a custom
+    /// identifier) enables directory identity tracking even when
+    /// [`follow_links`] is disabled. When neither is set, the behavior
+    /// of this iterator is unchanged.
+    ///
+    /// [`DirIdentityPolicy::AncestorsOnly`]: enum.DirIdentityPolicy.html#variant.AncestorsOnly
+    /// [`DirIdentityPolicy::OncePerScan`]: enum.DirIdentityPolicy.html#variant.OncePerScan
+    /// [`IntoIter::skipped_dirs`]: struct.IntoIter.html#method.skipped_dirs
+    /// [`dir_identifier`]: #method.dir_identifier
+    /// [`follow_links`]: #method.follow_links
+    pub fn dir_identity_policy(mut self, policy: DirIdentityPolicy) -> Self {
+        self.opts.dir_identity_policy = policy;
+        self
+    }
+
+    /// Set a custom provider of directory identities.
+    ///
+    /// By default, directories are identified by the underlying file
+    /// system (device and inode number, or the equivalent on other
+    /// platforms), so distinct paths that refer to the same directory
+    /// are recognized as aliases of one another. This method overrides
+    /// that behavior with a caller supplied [`DirIdentifier`], which is
+    /// consulted once for every directory that is about to be descended
+    /// into.
+    ///
+    /// Installing a custom identifier enables directory identity
+    /// tracking (governed by [`dir_identity_policy`]) even when
+    /// [`follow_links`] is disabled.
+    ///
+    /// If the identifier returns an error for a directory, the error is
+    /// yielded by the iterator like any other IO error and the directory
+    /// is not descended into. A failed identification is never treated
+    /// as the identity of a new directory.
+    ///
+    /// [`DirIdentifier`]: trait.DirIdentifier.html
+    /// [`dir_identity_policy`]: #method.dir_identity_policy
+    /// [`follow_links`]: #method.follow_links
+    pub fn dir_identifier<I>(mut self, identifier: I) -> Self
+    where
+        I: DirIdentifier + 'static,
+    {
+        self.opts.dir_identifier = Some(Box::new(identifier));
+        self
+    }
 }
 
 impl IntoIterator for WalkDir {
@@ -547,6 +629,9 @@ impl IntoIterator for WalkDir {
             depth: 0,
             deferred_dirs: vec![],
             root_device: None,
+            id_stack: vec![],
+            seen_dirs: HashMap::new(),
+            skipped_dirs: vec![],
         }
     }
 }
@@ -603,6 +688,27 @@ pub struct IntoIter {
     /// `None`. Conversely, if it is enabled, this is always `Some(...)` after
     /// handling the root path.
     root_device: Option<u64>,
+    /// A stack of directory identities paired with the path at which each
+    /// directory was first pushed.
+    ///
+    /// This is kept in sync with `stack_list`, but is only used when
+    /// directory identity tracking is active (see
+    /// [`IntoIter::identity_tracking`]). It is used to reject loops back
+    /// to an ancestor directory.
+    id_stack: Vec<(DirId, PathBuf)>,
+    /// The identities of all directories visited so far, mapped to the
+    /// path at which each directory was first visited.
+    ///
+    /// This is only populated when the [`DirIdentityPolicy::OncePerScan`]
+    /// policy is in effect.
+    ///
+    /// [`DirIdentityPolicy::OncePerScan`]: enum.DirIdentityPolicy.html#variant.OncePerScan
+    seen_dirs: HashMap<DirId, PathBuf>,
+    /// Directories skipped by the [`DirIdentityPolicy::OncePerScan`]
+    /// policy, in the order in which they were encountered.
+    ///
+    /// [`DirIdentityPolicy::OncePerScan`]: enum.DirIdentityPolicy.html#variant.OncePerScan
+    skipped_dirs: Vec<SkippedDir>,
 }
 
 /// An ancestor is an item in the directory tree traversed by walkdir, and is
@@ -837,6 +943,42 @@ impl IntoIter {
         FilterEntry { it: self, predicate }
     }
 
+    /// Return the directories skipped so far by the
+    /// [`DirIdentityPolicy::OncePerScan`] policy, in the order in which
+    /// they were encountered.
+    ///
+    /// Each skipped directory is reported together with the path at which
+    /// the same directory was first visited. When the policy is not in
+    /// effect, this always returns an empty slice.
+    ///
+    /// Since this borrows the iterator, it can be inspected after (or
+    /// while) driving iteration manually with a mutable reference:
+    ///
+    /// ```no_run
+    /// use walkdir::{DirIdentityPolicy, WalkDir};
+    ///
+    /// let mut it = WalkDir::new("foo")
+    ///     .follow_links(true)
+    ///     .dir_identity_policy(DirIdentityPolicy::OncePerScan)
+    ///     .into_iter();
+    /// while let Some(entry) = it.next() {
+    ///     println!("{}", entry?.path().display());
+    /// }
+    /// for skipped in it.skipped_dirs() {
+    ///     println!(
+    ///         "{} already visited as {}",
+    ///         skipped.path().display(),
+    ///         skipped.first_path().display()
+    ///     );
+    /// }
+    /// # Ok::<(), walkdir::Error>(())
+    /// ```
+    ///
+    /// [`DirIdentityPolicy::OncePerScan`]: enum.DirIdentityPolicy.html#variant.OncePerScan
+    pub fn skipped_dirs(&self) -> &[SkippedDir] {
+        &self.skipped_dirs
+    }
+
     fn handle_entry(
         &mut self,
         mut dent: DirEntry,
@@ -845,13 +987,14 @@ impl IntoIter {
             dent = itry!(self.follow(dent));
         }
         let is_normal_dir = !dent.file_type().is_symlink() && dent.is_dir();
+        let mut dedup_skipped = false;
         if is_normal_dir {
             if self.opts.same_file_system && dent.depth() > 0 {
                 if itry!(self.is_same_file_system(&dent)) {
-                    itry!(self.push(&dent));
+                    dedup_skipped = !itry!(self.push(&dent));
                 }
             } else {
-                itry!(self.push(&dent));
+                dedup_skipped = !itry!(self.push(&dent));
             }
         } else if dent.depth() == 0
             && dent.file_type().is_symlink()
@@ -870,6 +1013,12 @@ impl IntoIter {
             if md.file_type().is_dir() {
                 itry!(self.push(&dent));
             }
+        }
+        if dedup_skipped {
+            // The directory identity policy decided that this directory
+            // was already visited. It is neither yielded nor descended
+            // into, and has been recorded in `skipped_dirs` instead.
+            return None;
         }
         if is_normal_dir && self.opts.contents_first {
             self.deferred_dirs.push(dent);
@@ -898,7 +1047,44 @@ impl IntoIter {
         None
     }
 
-    fn push(&mut self, dent: &DirEntry) -> Result<()> {
+    /// Push the contents of the given directory onto the traversal stack.
+    ///
+    /// Returns `Ok(true)` if the directory will be descended into, or
+    /// `Ok(false)` if the directory identity policy decided that this
+    /// directory was already visited and should be skipped (in which case
+    /// it is recorded in `skipped_dirs` and nothing is pushed).
+    fn push(&mut self, dent: &DirEntry) -> Result<bool> {
+        // Resolve the directory identity before doing any other work, so
+        // that an identification failure is delivered as an error and the
+        // directory is neither descended into nor recorded as seen.
+        let dir_id = if self.identity_tracking() {
+            let id = self.identify_dir(dent)?;
+            // Both identity policies reject loops back to an ancestor.
+            for &(ref anc_id, ref anc_path) in self.id_stack.iter().rev() {
+                if *anc_id == id {
+                    return Err(Error::from_loop(
+                        self.depth,
+                        anc_path,
+                        dent.path(),
+                    ));
+                }
+            }
+            if self.opts.dir_identity_policy == DirIdentityPolicy::OncePerScan
+            {
+                if let Some(first_path) = self.seen_dirs.get(&id) {
+                    self.skipped_dirs.push(SkippedDir::new(
+                        dent.path().to_path_buf(),
+                        first_path.clone(),
+                        dent.depth(),
+                    ));
+                    return Ok(false);
+                }
+                self.seen_dirs.insert(id.clone(), dent.path().to_path_buf());
+            }
+            Some(id)
+        } else {
+            None
+        };
         // Make room for another open file descriptor if we've hit the max.
         let free =
             self.stack_list.len().checked_sub(self.oldest_opened).unwrap();
@@ -925,6 +1111,9 @@ impl IntoIter {
                 .map_err(|err| Error::from_io(self.depth, err))?;
             self.stack_path.push(ancestor);
         }
+        if let Some(id) = dir_id {
+            self.id_stack.push((id, dent.path().to_path_buf()));
+        }
         // We push this after stack_path since creating the Ancestor can fail.
         // If it fails, then we return the error and won't descend.
         self.stack_list.push(list);
@@ -944,13 +1133,16 @@ impl IntoIter {
             // never overflow.
             self.oldest_opened = self.oldest_opened.checked_add(1).unwrap();
         }
-        Ok(())
+        Ok(true)
     }
 
     fn pop(&mut self) {
         self.stack_list.pop().expect("BUG: cannot pop from empty stack");
         if self.opts.follow_links {
             self.stack_path.pop().expect("BUG: list/path stacks out of sync");
+        }
+        if self.identity_tracking() {
+            self.id_stack.pop().expect("BUG: list/id stacks out of sync");
         }
         // If everything in the stack is already closed, then there is
         // room for at least one more open descriptor and it will
@@ -999,6 +1191,36 @@ impl IntoIter {
 
     fn skippable(&self) -> bool {
         self.depth < self.opts.min_depth || self.depth > self.opts.max_depth
+    }
+
+    /// Returns true if directory identity tracking is active.
+    ///
+    /// Tracking is active when a custom identity provider is installed or
+    /// when the [`DirIdentityPolicy::OncePerScan`] policy is in effect.
+    /// When tracking is inactive, the iterator behaves exactly as it
+    /// always has.
+    ///
+    /// [`DirIdentityPolicy::OncePerScan`]: enum.DirIdentityPolicy.html#variant.OncePerScan
+    fn identity_tracking(&self) -> bool {
+        self.opts.dir_identifier.is_some()
+            || self.opts.dir_identity_policy == DirIdentityPolicy::OncePerScan
+    }
+
+    /// Return the identity of the directory described by `dent`, using
+    /// the custom identity provider if one is installed and the file
+    /// system otherwise.
+    ///
+    /// Identification failures are converted to an [`Error`] associated
+    /// with the directory entry, matching how other IO errors are
+    /// delivered by this iterator.
+    ///
+    /// [`Error`]: struct.Error.html
+    fn identify_dir(&self, dent: &DirEntry) -> Result<DirId> {
+        let result = match self.opts.dir_identifier {
+            Some(ref identifier) => identifier.identify(dent.path()),
+            None => crate::identity::system_dir_id(dent.path()),
+        };
+        result.map_err(|err| Error::from_entry(dent, err))
     }
 }
 
