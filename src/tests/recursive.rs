@@ -1,8 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::tests::util::Dir;
-use crate::WalkDir;
+use crate::{
+    DirIdentity, DirIdentityPolicy, DirIdentityProvider, WalkDir,
+};
 
 #[test]
 fn send_sync_traits() {
@@ -323,6 +327,7 @@ fn siblings() {
 
 #[test]
 fn sym_root_file_nofollow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.touch("a");
     dir.symlink_file("a", "a-link");
@@ -354,6 +359,7 @@ fn sym_root_file_nofollow() {
 
 #[test]
 fn sym_root_file_follow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.touch("a");
     dir.symlink_file("a", "a-link");
@@ -384,6 +390,7 @@ fn sym_root_file_follow() {
 
 #[test]
 fn broken_sym_root_dir_nofollow_and_root_nofollow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.symlink_dir("broken", "a-link");
 
@@ -400,6 +407,7 @@ fn broken_sym_root_dir_nofollow_and_root_nofollow() {
 
 #[test]
 fn broken_sym_root_dir_follow_and_root_nofollow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.symlink_dir("broken", "a-link");
 
@@ -417,6 +425,7 @@ fn broken_sym_root_dir_follow_and_root_nofollow() {
 
 #[test]
 fn broken_sym_root_dir_root_is_always_followed() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.symlink_dir("broken", "a-link");
 
@@ -435,6 +444,7 @@ fn broken_sym_root_dir_root_is_always_followed() {
 
 #[test]
 fn sym_root_dir_nofollow_root_nofollow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a");
     dir.symlink_dir("a", "a-link");
@@ -453,6 +463,7 @@ fn sym_root_dir_nofollow_root_nofollow() {
 
 #[test]
 fn sym_root_dir_nofollow_root_follow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a");
     dir.symlink_dir("a", "a-link");
@@ -489,6 +500,7 @@ fn sym_root_dir_nofollow_root_follow() {
 
 #[test]
 fn sym_root_dir_follow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a");
     dir.symlink_dir("a", "a-link");
@@ -525,6 +537,7 @@ fn sym_root_dir_follow() {
 
 #[test]
 fn sym_file_nofollow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.touch("a");
     dir.symlink_file("a", "a-link");
@@ -561,6 +574,7 @@ fn sym_file_nofollow() {
 
 #[test]
 fn sym_file_follow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.touch("a");
     dir.symlink_file("a", "a-link");
@@ -597,6 +611,7 @@ fn sym_file_follow() {
 
 #[test]
 fn sym_dir_nofollow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a");
     dir.symlink_dir("a", "a-link");
@@ -634,6 +649,7 @@ fn sym_dir_nofollow() {
 
 #[test]
 fn sym_dir_follow() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a");
     dir.symlink_dir("a", "a-link");
@@ -677,6 +693,7 @@ fn sym_dir_follow() {
 
 #[test]
 fn sym_noloop() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a/b/c");
     dir.symlink_dir("a", "a/b/c/a-link");
@@ -691,6 +708,7 @@ fn sym_noloop() {
 
 #[test]
 fn sym_loop_detect() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.mkdirp("a/b/c");
     dir.symlink_dir("a", "a/b/c/a-link");
@@ -716,6 +734,7 @@ fn sym_loop_detect() {
 
 #[test]
 fn sym_self_loop_no_error() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.symlink_file("a", "a");
 
@@ -741,6 +760,7 @@ fn sym_self_loop_no_error() {
 
 #[test]
 fn sym_file_self_loop_io_error() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.symlink_file("a", "a");
 
@@ -762,6 +782,7 @@ fn sym_file_self_loop_io_error() {
 
 #[test]
 fn sym_dir_self_loop_io_error() {
+    skip_without_symlinks!();
     let dir = Dir::tmp();
     dir.symlink_dir("a", "a");
 
@@ -1089,4 +1110,384 @@ fn regression_skip_current_dir() {
     wd.skip_current_dir();
     wd.skip_current_dir();
     wd.next();
+}
+
+// ---------------------------------------------------------------------------
+// Directory identity policy tests
+//
+// These tests exercise the directory identity policy. Because native
+// symbolic links require special privileges on some platforms (notably
+// Windows), the primary fixture is a *fake* identity provider that maps
+// chosen paths to chosen identities. This lets us simulate aliases (two
+// distinct paths that point to the same directory) and loops without
+// requiring real symlink support. Native symlink tests, gated by
+// `skip_without_symlinks!()`, are provided where useful.
+// ---------------------------------------------------------------------------
+
+/// A fake directory identity provider for testing.
+///
+/// Paths registered with [`FakeIdentityProvider::with_id``] are mapped to a
+/// fixed custom identity. Paths registered with
+/// [`FakeIdentityProvider::with_error`] return an error when their identity is
+/// requested. All other paths use the real file system identity.
+#[derive(Debug, Default)]
+struct FakeIdentityProvider {
+    ids: HashMap<PathBuf, u64>,
+    error_paths: Vec<PathBuf>,
+}
+
+impl FakeIdentityProvider {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_id<P: AsRef<Path>>(mut self, path: P, id: u64) -> Self {
+        self.ids.insert(path.as_ref().to_path_buf(), id);
+        self
+    }
+
+    fn with_error<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.error_paths.push(path.as_ref().to_path_buf());
+        self
+    }
+}
+
+impl DirIdentityProvider for FakeIdentityProvider {
+    fn identity(&self, path: &Path) -> io::Result<DirIdentity> {
+        if self.error_paths.iter().any(|p| p == path) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "fake identity provider error",
+            ));
+        }
+        if let Some(&id) = self.ids.get(path) {
+            return Ok(DirIdentity::custom(id));
+        }
+        DirIdentity::from_path(path)
+    }
+}
+
+/// In global mode, two distinct paths with the same identity are visited only
+/// once. The skipped entry and the first path are reported.
+#[test]
+fn dir_identity_global_dedup() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a");
+    dir.mkdirp("b");
+    dir.touch_all(&["a/a1", "b/b1"]);
+
+    // a and b are distinct directories on disk, but the fake provider maps
+    // them to the same identity.
+    let provider = FakeIdentityProvider::new()
+        .with_id(dir.join("a"), 42)
+        .with_id(dir.join("b"), 42);
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .dir_identity_policy(DirIdentityPolicy::Global)
+        .dir_identity_provider(provider)
+        .sort_by_file_name();
+    let r = dir.run_recursive(wd);
+
+    // b is skipped because it has the same identity as a.
+    let paths = r.sorted_paths();
+    assert_eq!(
+        paths,
+        vec![dir.path().to_path_buf(), dir.join("a"), dir.join("a/a1"),]
+    );
+
+    // One duplicate error reporting b as the skipped entry and a as the
+    // first path.
+    assert_eq!(r.errs().len(), 1);
+    let err = &r.errs()[0];
+    assert_eq!(err.path(), Some(dir.join("b").as_path()));
+    assert_eq!(err.duplicate_first_path(), Some(dir.join("a").as_path()));
+    assert!(err.loop_ancestor().is_none());
+    assert!(err.io_error().is_none());
+}
+
+/// In ancestor mode, two distinct paths with the same identity may both be
+/// visited as long as they are in different branches.
+#[test]
+fn dir_identity_ancestor_allows_branches() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a");
+    dir.mkdirp("b");
+    dir.touch_all(&["a/a1", "b/b1"]);
+
+    let provider = FakeIdentityProvider::new()
+        .with_id(dir.join("a"), 42)
+        .with_id(dir.join("b"), 42);
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .dir_identity_policy(DirIdentityPolicy::Ancestor)
+        .dir_identity_provider(provider)
+        .sort_by_file_name();
+    let r = dir.run_recursive(wd);
+
+    // Both a and b are visited because they are in different branches.
+    r.assert_no_errors();
+    let paths = r.sorted_paths();
+    assert_eq!(
+        paths,
+        vec![
+            dir.path().to_path_buf(),
+            dir.join("a"),
+            dir.join("a/a1"),
+            dir.join("b"),
+            dir.join("b/b1"),
+        ]
+    );
+}
+
+/// A directory that points back to the root (an ancestor) is rejected as a
+/// loop in both ancestor and global modes.
+///
+/// This uses the fake provider to simulate a symlink from `a/back` to the
+/// root: `a/back` is given the same identity as the root. The native
+/// equivalent is tested in `dir_identity_native_symlink_loop`.
+#[test]
+fn dir_identity_loop_to_root_both_modes() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a/back");
+
+    for policy in &[DirIdentityPolicy::Ancestor, DirIdentityPolicy::Global] {
+        let provider = FakeIdentityProvider::new()
+            .with_id(dir.path(), 1) // root
+            .with_id(dir.join("a"), 2) // a
+            .with_id(dir.join("a/back"), 1); // a/back "points back to" root
+
+        let wd = WalkDir::new(dir.path())
+            .follow_links(true)
+            .dir_identity_policy(*policy)
+            .dir_identity_provider(provider)
+            .sort_by_file_name();
+        let r = dir.run_recursive(wd);
+
+        // a/back is rejected because it points back to the root (an ancestor).
+        let paths = r.sorted_paths();
+        assert_eq!(
+            paths,
+            vec![dir.path().to_path_buf(), dir.join("a"),]
+        );
+
+        assert_eq!(r.errs().len(), 1);
+        let err = &r.errs()[0];
+        assert_eq!(err.path(), Some(dir.join("a/back").as_path()));
+        assert_eq!(err.loop_ancestor(), Some(dir.path()));
+        assert!(err.duplicate_first_path().is_none());
+        assert!(err.io_error().is_none());
+    }
+}
+
+/// An identity provider failure is delivered through the error channel and
+/// does not cause the directory to be descended into.
+#[test]
+fn dir_identity_error_not_swallowed() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a");
+    dir.mkdirp("b");
+
+    let provider =
+        FakeIdentityProvider::new().with_error(dir.join("b"));
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .dir_identity_policy(DirIdentityPolicy::Global)
+        .dir_identity_provider(provider)
+        .sort_by_file_name();
+    let r = dir.run_recursive(wd);
+
+    // b is not descended into because its identity cannot be determined.
+    let paths = r.sorted_paths();
+    assert_eq!(
+        paths,
+        vec![dir.path().to_path_buf(), dir.join("a"),]
+    );
+
+    // The identity error is delivered (not swallowed).
+    assert_eq!(r.errs().len(), 1);
+    let err = &r.errs()[0];
+    assert_eq!(err.path(), Some(dir.join("b").as_path()));
+    assert!(err.io_error().is_some());
+    assert_eq!(err.io_error().unwrap().kind(), io::ErrorKind::Other);
+}
+
+/// The max_depth option continues to work when the identity policy is enabled.
+#[test]
+fn dir_identity_max_depth() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a/b/c");
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .max_depth(2)
+        .dir_identity_policy(DirIdentityPolicy::Global)
+        .sort_by_file_name();
+    let r = dir.run_recursive(wd);
+    r.assert_no_errors();
+
+    let paths = r.sorted_paths();
+    assert_eq!(
+        paths,
+        vec![dir.path().to_path_buf(), dir.join("a"), dir.join("a/b"),]
+    );
+}
+
+/// Entries are yielded in depth-first, sorted order when the identity policy
+/// is enabled. The duplicate error is yielded in the order in which the
+/// duplicate entry is encountered.
+#[test]
+fn dir_identity_order() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a");
+    dir.mkdirp("b");
+    dir.touch_all(&["a/a1", "b/b1"]);
+
+    let provider = FakeIdentityProvider::new()
+        .with_id(dir.join("a"), 42)
+        .with_id(dir.join("b"), 42);
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .dir_identity_policy(DirIdentityPolicy::Global)
+        .dir_identity_provider(provider)
+        .sort_by_file_name();
+
+    // Collect entries and errors in the order in which they are yielded.
+    let mut items: Vec<String> = vec![];
+    for result in wd {
+        match result {
+            Ok(ent) => items.push(format!("ok:{}", ent.path().display())),
+            Err(err) => {
+                items.push(format!("err:{}", err.path().unwrap().display()))
+            }
+        }
+    }
+
+    assert_eq!(
+        items,
+        vec![
+            format!("ok:{}", dir.path().display()),
+            format!("ok:{}", dir.join("a").display()),
+            format!("ok:{}", dir.join("a").join("a1").display()),
+            format!("err:{}", dir.join("b").display()),
+        ]
+    );
+}
+
+/// With `contents_first`, a directory's contents are yielded before the
+/// directory itself. The identity policy continues to detect duplicates.
+#[test]
+fn dir_identity_contents_first() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a");
+    dir.mkdirp("b");
+    dir.touch_all(&["a/a1", "b/b1"]);
+
+    let provider = FakeIdentityProvider::new()
+        .with_id(dir.join("a"), 42)
+        .with_id(dir.join("b"), 42);
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .contents_first(true)
+        .dir_identity_policy(DirIdentityPolicy::Global)
+        .dir_identity_provider(provider)
+        .sort_by_file_name();
+    let r = dir.run_recursive(wd);
+
+    // a's contents are yielded before a itself. b is a duplicate of a and is
+    // skipped (the error is yielded in the order in which b is encountered).
+    let paths = r.paths();
+    assert_eq!(
+        paths,
+        vec![
+            dir.join("a").join("a1"),
+            dir.join("a"),
+            dir.path().to_path_buf(),
+        ]
+    );
+
+    assert_eq!(r.errs().len(), 1);
+    let err = &r.errs()[0];
+    assert_eq!(err.path(), Some(dir.join("b").as_path()));
+    assert_eq!(err.duplicate_first_path(), Some(dir.join("a").as_path()));
+}
+
+/// Native symlink test: a symlink from `a/back` to the root is rejected as a
+/// loop in both ancestor and global modes.
+///
+/// This test only runs when the system supports symbolic links. On systems
+/// that do not (for example, Windows without the symlink privilege or
+/// developer mode), the fake identity provider fixture in
+/// `dir_identity_loop_to_root_both_modes` provides equivalent coverage.
+#[test]
+fn dir_identity_native_symlink_loop() {
+    skip_without_symlinks!();
+    let dir = Dir::tmp();
+    dir.mkdirp("a/b/c");
+    dir.symlink_dir(".", "a/back"); // a/back -> root
+
+    for policy in &[DirIdentityPolicy::Ancestor, DirIdentityPolicy::Global] {
+        let wd = WalkDir::new(dir.path())
+            .follow_links(true)
+            .dir_identity_policy(*policy)
+            .sort_by_file_name();
+        let r = dir.run_recursive(wd);
+
+        // a/back points back to the root, which is an ancestor.
+        let paths = r.sorted_paths();
+        assert_eq!(
+            paths,
+            vec![
+                dir.path().to_path_buf(),
+                dir.join("a"),
+                dir.join("a/b"),
+                dir.join("a/b/c"),
+            ]
+        );
+
+        assert_eq!(r.errs().len(), 1);
+        let err = &r.errs()[0];
+        assert_eq!(err.path(), Some(dir.join("a/back").as_path()));
+        assert_eq!(err.loop_ancestor(), Some(dir.path()));
+        assert!(err.duplicate_first_path().is_none());
+    }
+}
+
+/// Native symlink test: a symlink to a previously visited directory is
+/// skipped in global mode.
+///
+/// This test only runs when the system supports symbolic links. On systems
+/// that do not, the fake identity provider fixture in
+/// `dir_identity_global_dedup` provides equivalent coverage.
+#[test]
+fn dir_identity_native_symlink_global_dedup() {
+    skip_without_symlinks!();
+    let dir = Dir::tmp();
+    dir.mkdirp("a");
+    dir.symlink_dir("a", "b"); // b is a symlink to a
+    dir.touch("a/a1");
+
+    let wd = WalkDir::new(dir.path())
+        .follow_links(true)
+        .dir_identity_policy(DirIdentityPolicy::Global)
+        .sort_by_file_name();
+    let r = dir.run_recursive(wd);
+
+    // b is a symlink to a, so they have the same identity. b is skipped.
+    let paths = r.sorted_paths();
+    assert_eq!(
+        paths,
+        vec![dir.path().to_path_buf(), dir.join("a"), dir.join("a/a1"),]
+    );
+
+    assert_eq!(r.errs().len(), 1);
+    let err = &r.errs()[0];
+    assert_eq!(err.path(), Some(dir.join("b").as_path()));
+    assert_eq!(err.duplicate_first_path(), Some(dir.join("a").as_path()));
+    assert!(err.loop_ancestor().is_none());
+    assert!(err.io_error().is_none());
 }

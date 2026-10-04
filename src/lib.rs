@@ -110,12 +110,14 @@ for entry in walker.filter_entry(|e| !is_hidden(e)) {
 doc_comment::doctest!("../README.md");
 
 use std::cmp::{min, Ordering};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, ReadDir};
 use std::io;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::Arc;
 use std::vec;
 
 use same_file::Handle;
@@ -155,6 +157,121 @@ macro_rules! itry {
 /// [`io::Result`]: https://doc.rust-lang.org/stable/std/io/type.Result.html
 /// [`try!`]: https://doc.rust-lang.org/stable/std/macro.try.html
 pub type Result<T> = ::std::result::Result<T, Error>;
+
+/// The strategy used to identify directories when following symbolic links.
+///
+/// When symbolic links are followed, the iterator needs a way to determine
+/// whether two directory entries refer to the same underlying directory. This
+/// policy controls how that identity is used.
+///
+/// The default policy is [`Ancestor`], which matches the historical behavior
+/// of this crate: a directory may be visited more than once (for example,
+/// through different branches), but a symbolic link that points back to an
+/// ancestor of the current traversal is reported as a loop.
+///
+/// [`Ancestor`]: enum.DirIdentityPolicy.html#variant.Ancestor
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DirIdentityPolicy {
+    /// Only detect loops against the ancestors of the current traversal.
+    ///
+    /// A directory may be visited more than once if it is reached through
+    /// different branches. A symbolic link that points to an ancestor of the
+    /// current traversal is reported as a loop and is not descended into.
+    ///
+    /// This is the default policy.
+    #[default]
+    Ancestor,
+    /// Each distinct directory is visited at most once across the entire
+    /// traversal.
+    ///
+    /// When a directory is encountered whose identity matches a directory that
+    /// was already visited, the entry is reported as a duplicate (via the
+    /// error channel) and is not descended into. A symbolic link that points
+    /// to an ancestor is still reported as a loop.
+    Global,
+}
+
+/// The identity of a directory.
+///
+/// This is used to detect loops and duplicate visits when following symbolic
+/// links. Two directories with the same identity are considered to be the same
+/// directory.
+///
+/// The default identity is the file system identity (device and inode numbers
+/// on Unix), so that paths which alias the same directory (for example, hard
+/// links or bind mounts) are recognized as identical. Custom identities may be
+/// supplied by a [`DirIdentityProvider`].
+///
+/// [`DirIdentityProvider`]: trait.DirIdentityProvider.html
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DirIdentity {
+    inner: DirIdentityInner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DirIdentityInner {
+    /// A real file system identity.
+    Real(Arc<Handle>),
+    /// A custom identity supplied by a [`DirIdentityProvider`].
+    ///
+    /// [`DirIdentityProvider`]: trait.DirIdentityProvider.html
+    Custom(u64),
+}
+
+impl DirIdentity {
+    /// Creates a real directory identity from the given path.
+    ///
+    /// This opens the path and inspects its file system identity. If the path
+    /// cannot be opened or its identity cannot be determined, an error is
+    /// returned.
+    pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Handle::from_path(path).map(|h| DirIdentity {
+            inner: DirIdentityInner::Real(Arc::new(h)),
+        })
+    }
+
+    /// Creates a custom directory identity.
+    ///
+    /// This is useful for testing or for providing identities that are not
+    /// tied to the underlying file system.
+    pub fn custom(id: u64) -> Self {
+        DirIdentity { inner: DirIdentityInner::Custom(id) }
+    }
+}
+
+/// A provider of directory identities.
+///
+/// When symbolic links are followed, the iterator uses a provider to determine
+/// the identity of each directory it descends into. The default provider uses
+/// the file system identity (device and inode numbers on Unix), so that paths
+/// which alias the same directory are recognized as identical.
+///
+/// A custom provider may be supplied to [`WalkDir::dir_identity_provider`].
+/// This is useful for testing or for providing identities that are not tied to
+/// the underlying file system.
+///
+/// [`WalkDir::dir_identity_provider`]: struct.WalkDir.html#method.dir_identity_provider
+pub trait DirIdentityProvider: Send + Sync {
+    /// Returns the identity of the directory at `path`.
+    ///
+    /// If the identity cannot be determined, an error is returned. The error
+    /// is reported through the normal error delivery mechanism and the
+    /// directory is not descended into.
+    fn identity(&self, path: &Path) -> io::Result<DirIdentity>;
+}
+
+/// The default directory identity provider.
+///
+/// This uses the file system identity (device and inode numbers on Unix), so
+/// that paths which alias the same directory are recognized as identical.
+#[derive(Debug, Default)]
+struct RealIdentityProvider;
+
+impl DirIdentityProvider for RealIdentityProvider {
+    fn identity(&self, path: &Path) -> io::Result<DirIdentity> {
+        DirIdentity::from_path(path)
+    }
+}
 
 /// A builder to create an iterator for recursively walking a directory.
 ///
@@ -230,6 +347,33 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 ///
 /// Note that when following symbolic/soft links, loops are detected and an
 /// error is reported.
+///
+/// # Directory identity policy
+///
+/// When following symbolic links, the iterator identifies each directory it
+/// descends into by its file system identity (device and inode numbers), not
+/// by its display path. This means that aliases (distinct paths that point to
+/// the same directory, such as hard links or bind mounts) are recognized as
+/// identical.
+///
+/// The [`dir_identity_policy`] option controls how this identity is used:
+///
+/// * [`DirIdentityPolicy::Ancestor`] (the default) detects loops against the
+///   ancestors of the current traversal. A directory may be visited more than
+///   once if it is reached through different branches.
+/// * [`DirIdentityPolicy::Global`] visits each distinct directory at most once
+///   across the entire traversal. When a directory is encountered whose
+///   identity matches one already visited, the entry is reported as a
+///   duplicate and is not descended into.
+///
+/// A custom identity provider may be supplied via [`dir_identity_provider`].
+/// This is useful for testing or for providing identities that are not tied to
+/// the underlying file system.
+///
+/// [`dir_identity_policy`]: struct.WalkDir.html#method.dir_identity_policy
+/// [`dir_identity_provider`]: struct.WalkDir.html#method.dir_identity_provider
+/// [`DirIdentityPolicy::Ancestor`]: enum.DirIdentityPolicy.html#variant.Ancestor
+/// [`DirIdentityPolicy::Global`]: enum.DirIdentityPolicy.html#variant.Global
 #[derive(Debug)]
 pub struct WalkDir {
     opts: WalkDirOptions,
@@ -252,6 +396,8 @@ struct WalkDirOptions {
     >,
     contents_first: bool,
     same_file_system: bool,
+    dir_identity_policy: DirIdentityPolicy,
+    dir_identity_provider: Box<dyn DirIdentityProvider>,
 }
 
 impl fmt::Debug for WalkDirOptions {
@@ -274,6 +420,8 @@ impl fmt::Debug for WalkDirOptions {
             .field("sorter", &sorter_str)
             .field("contents_first", &self.contents_first)
             .field("same_file_system", &self.same_file_system)
+            .field("dir_identity_policy", &self.dir_identity_policy)
+            .field("dir_identity_provider", &"...")
             .finish()
     }
 }
@@ -297,6 +445,8 @@ impl WalkDir {
                 sorter: None,
                 contents_first: false,
                 same_file_system: false,
+                dir_identity_policy: DirIdentityPolicy::default(),
+                dir_identity_provider: Box::new(RealIdentityProvider),
             },
             root: root.as_ref().to_path_buf(),
         }
@@ -531,6 +681,46 @@ impl WalkDir {
         self.opts.same_file_system = yes;
         self
     }
+
+    /// Set the directory identity policy.
+    ///
+    /// This controls how directories are identified when following symbolic
+    /// links. See [`DirIdentityPolicy`] for the available policies. The
+    /// default is [`DirIdentityPolicy::Ancestor`].
+    ///
+    /// This option only has an effect when [`follow_links`] is enabled.
+    ///
+    /// [`DirIdentityPolicy`]: enum.DirIdentityPolicy.html
+    /// [`DirIdentityPolicy::Ancestor`]: enum.DirIdentityPolicy.html#variant.Ancestor
+    /// [`follow_links`]: struct.WalkDir.html#method.follow_links
+    pub fn dir_identity_policy(
+        mut self,
+        policy: DirIdentityPolicy,
+    ) -> Self {
+        self.opts.dir_identity_policy = policy;
+        self
+    }
+
+    /// Set the directory identity provider.
+    ///
+    /// The provider is used to determine the identity of each directory when
+    /// following symbolic links. The default provider uses the file system
+    /// identity (device and inode numbers on Unix), so that paths which alias
+    /// the same directory are recognized as identical.
+    ///
+    /// A custom provider is useful for testing or for providing identities
+    /// that are not tied to the underlying file system.
+    ///
+    /// This option only has an effect when [`follow_links`] is enabled.
+    ///
+    /// [`follow_links`]: struct.WalkDir.html#method.follow_links
+    pub fn dir_identity_provider<P>(mut self, provider: P) -> Self
+    where
+        P: DirIdentityProvider + 'static,
+    {
+        self.opts.dir_identity_provider = Box::new(provider);
+        self
+    }
 }
 
 impl IntoIterator for WalkDir {
@@ -547,6 +737,7 @@ impl IntoIterator for WalkDir {
             depth: 0,
             deferred_dirs: vec![],
             root_device: None,
+            visited: HashMap::new(),
         }
     }
 }
@@ -603,6 +794,14 @@ pub struct IntoIter {
     /// `None`. Conversely, if it is enabled, this is always `Some(...)` after
     /// handling the root path.
     root_device: Option<u64>,
+    /// A map from directory identity to the first path at which that identity
+    /// was visited.
+    ///
+    /// This is only used when the global [directory identity policy] is
+    /// enabled. In all other cases this map is empty.
+    ///
+    /// [directory identity policy]: struct.WalkDir.html#method.dir_identity_policy
+    visited: HashMap<DirIdentity, PathBuf>,
 }
 
 /// An ancestor is an item in the directory tree traversed by walkdir, and is
@@ -611,40 +810,14 @@ pub struct IntoIter {
 struct Ancestor {
     /// The path of this ancestor.
     path: PathBuf,
-    /// An open file to this ancesor. This is only used on Windows where
-    /// opening a file handle appears to be quite expensive, so we choose to
-    /// cache it. This comes at the cost of not respecting the file descriptor
-    /// limit set by the user.
-    #[cfg(windows)]
-    handle: Handle,
+    /// The identity of this ancestor.
+    identity: DirIdentity,
 }
 
 impl Ancestor {
-    /// Create a new ancestor from the given directory path.
-    #[cfg(windows)]
-    fn new(dent: &DirEntry) -> io::Result<Ancestor> {
-        let handle = Handle::from_path(dent.path())?;
-        Ok(Ancestor { path: dent.path().to_path_buf(), handle })
-    }
-
-    /// Create a new ancestor from the given directory path.
-    #[cfg(not(windows))]
-    fn new(dent: &DirEntry) -> io::Result<Ancestor> {
-        Ok(Ancestor { path: dent.path().to_path_buf() })
-    }
-
-    /// Returns true if and only if the given open file handle corresponds to
-    /// the same directory as this ancestor.
-    #[cfg(windows)]
-    fn is_same(&self, child: &Handle) -> io::Result<bool> {
-        Ok(child == &self.handle)
-    }
-
-    /// Returns true if and only if the given open file handle corresponds to
-    /// the same directory as this ancestor.
-    #[cfg(not(windows))]
-    fn is_same(&self, child: &Handle) -> io::Result<bool> {
-        Ok(child == &Handle::from_path(&self.path)?)
+    /// Create a new ancestor from the given directory path and identity.
+    fn new(path: PathBuf, identity: DirIdentity) -> Ancestor {
+        Ancestor { path, identity }
     }
 }
 
@@ -899,6 +1072,45 @@ impl IntoIter {
     }
 
     fn push(&mut self, dent: &DirEntry) -> Result<()> {
+        // When following symbolic links, compute the identity of this
+        // directory and check for loops and duplicates before doing any
+        // work. This ensures that an identity failure is delivered through
+        // the normal error channel and does not cause the directory to be
+        // descended into.
+        let identity = if self.opts.follow_links {
+            let identity = self
+                .opts
+                .dir_identity_provider
+                .identity(dent.path())
+                .map_err(|err| {
+                    Error::from_path(self.depth, dent.path().to_path_buf(), err)
+                })?;
+            // Check for a loop against the ancestors of the current
+            // traversal.
+            for ancestor in self.stack_path.iter().rev() {
+                if ancestor.identity == identity {
+                    return Err(Error::from_loop(
+                        self.depth,
+                        &ancestor.path,
+                        dent.path(),
+                    ));
+                }
+            }
+            // In global mode, check whether this directory has already been
+            // visited.
+            if self.opts.dir_identity_policy == DirIdentityPolicy::Global {
+                if let Some(first) = self.visited.get(&identity) {
+                    return Err(Error::from_duplicate(
+                        self.depth,
+                        dent.path(),
+                        first,
+                    ));
+                }
+            }
+            Some(identity)
+        } else {
+            None
+        };
         // Make room for another open file descriptor if we've hit the max.
         let free =
             self.stack_list.len().checked_sub(self.oldest_opened).unwrap();
@@ -920,10 +1132,13 @@ impl IntoIter {
             });
             list = DirList::Closed(entries.into_iter());
         }
-        if self.opts.follow_links {
-            let ancestor = Ancestor::new(&dent)
-                .map_err(|err| Error::from_io(self.depth, err))?;
-            self.stack_path.push(ancestor);
+        if let Some(identity) = identity {
+            if self.opts.dir_identity_policy == DirIdentityPolicy::Global {
+                self.visited
+                    .insert(identity.clone(), dent.path().to_path_buf());
+            }
+            self.stack_path
+                .push(Ancestor::new(dent.path().to_path_buf(), identity));
         }
         // We push this after stack_path since creating the Ancestor can fail.
         // If it fails, then we return the error and won't descend.
@@ -961,31 +1176,12 @@ impl IntoIter {
     fn follow(&self, mut dent: DirEntry) -> Result<DirEntry> {
         dent =
             DirEntry::from_path(self.depth, dent.path().to_path_buf(), true)?;
-        // The only way a symlink can cause a loop is if it points
-        // to a directory. Otherwise, it always points to a leaf
-        // and we can omit any loop checks.
-        if dent.is_dir() {
-            self.check_loop(dent.path())?;
-        }
+        // Loop and duplicate checks are done in [`push`], which is called
+        // for directories after the symlink is resolved. Here we only
+        // resolve the symlink.
+        //
+        // [`push`]: struct.IntoIter.html#method.push
         Ok(dent)
-    }
-
-    fn check_loop<P: AsRef<Path>>(&self, child: P) -> Result<()> {
-        let hchild = Handle::from_path(&child)
-            .map_err(|err| Error::from_io(self.depth, err))?;
-        for ancestor in self.stack_path.iter().rev() {
-            let is_same = ancestor
-                .is_same(&hchild)
-                .map_err(|err| Error::from_io(self.depth, err))?;
-            if is_same {
-                return Err(Error::from_loop(
-                    self.depth,
-                    &ancestor.path,
-                    child.as_ref(),
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn is_same_file_system(&mut self, dent: &DirEntry) -> Result<bool> {

@@ -34,6 +34,7 @@ pub struct Error {
 enum ErrorInner {
     Io { path: Option<PathBuf>, err: io::Error },
     Loop { ancestor: PathBuf, child: PathBuf },
+    Duplicate { first: PathBuf, path: PathBuf },
 }
 
 impl Error {
@@ -48,6 +49,7 @@ impl Error {
             ErrorInner::Io { path: None, .. } => None,
             ErrorInner::Io { path: Some(ref path), .. } => Some(path),
             ErrorInner::Loop { ref child, .. } => Some(child),
+            ErrorInner::Duplicate { ref path, .. } => Some(path),
         }
     }
 
@@ -66,6 +68,27 @@ impl Error {
     pub fn loop_ancestor(&self) -> Option<&Path> {
         match self.inner {
             ErrorInner::Loop { ref ancestor, .. } => Some(ancestor),
+            _ => None,
+        }
+    }
+
+    /// Returns the path at which a duplicate directory was first visited.
+    ///
+    /// If no duplicate was detected, [`None`] is returned.
+    ///
+    /// A duplicate is detected when a directory is encountered whose identity
+    /// matches a directory that was already visited. This can only occur when
+    /// the global [directory identity policy] is enabled.
+    ///
+    /// To get the path to the duplicate directory entry, use the [`path`]
+    /// method.
+    ///
+    /// [`None`]: https://doc.rust-lang.org/stable/std/option/enum.Option.html#variant.None
+    /// [`path`]: struct.Error.html#path
+    /// [directory identity policy]: struct.WalkDir.html#method.dir_identity_policy
+    pub fn duplicate_first_path(&self) -> Option<&Path> {
+        match self.inner {
+            ErrorInner::Duplicate { ref first, .. } => Some(first),
             _ => None,
         }
     }
@@ -144,6 +167,7 @@ impl Error {
         match self.inner {
             ErrorInner::Io { ref err, .. } => Some(err),
             ErrorInner::Loop { .. } => None,
+            ErrorInner::Duplicate { .. } => None,
         }
     }
 
@@ -156,6 +180,7 @@ impl Error {
         match self.inner {
             ErrorInner::Io { err, .. } => Some(err),
             ErrorInner::Loop { .. } => None,
+            ErrorInner::Duplicate { .. } => None,
         }
     }
 
@@ -194,6 +219,20 @@ impl Error {
             },
         }
     }
+
+    pub(crate) fn from_duplicate(
+        depth: usize,
+        path: &Path,
+        first: &Path,
+    ) -> Self {
+        Error {
+            depth,
+            inner: ErrorInner::Duplicate {
+                first: first.to_path_buf(),
+                path: path.to_path_buf(),
+            },
+        }
+    }
 }
 
 impl error::Error for Error {
@@ -202,6 +241,7 @@ impl error::Error for Error {
         match self.inner {
             ErrorInner::Io { ref err, .. } => err.description(),
             ErrorInner::Loop { .. } => "file system loop found",
+            ErrorInner::Duplicate { .. } => "directory visited more than once",
         }
     }
 
@@ -213,6 +253,7 @@ impl error::Error for Error {
         match self.inner {
             ErrorInner::Io { ref err, .. } => Some(err),
             ErrorInner::Loop { .. } => None,
+            ErrorInner::Duplicate { .. } => None,
         }
     }
 }
@@ -234,6 +275,12 @@ impl fmt::Display for Error {
                 child.display(),
                 ancestor.display()
             ),
+            ErrorInner::Duplicate { ref first, ref path } => write!(
+                f,
+                "Directory {} was already visited at {}",
+                path.display(),
+                first.display()
+            ),
         }
     }
 }
@@ -254,6 +301,9 @@ impl From<Error> for io::Error {
         let kind = match walk_err {
             Error { inner: ErrorInner::Io { ref err, .. }, .. } => err.kind(),
             Error { inner: ErrorInner::Loop { .. }, .. } => {
+                io::ErrorKind::Other
+            }
+            Error { inner: ErrorInner::Duplicate { .. }, .. } => {
                 io::ErrorKind::Other
             }
         };

@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::{DirEntry, Error};
 
@@ -13,6 +14,67 @@ macro_rules! err {
     ($($tt:tt)*) => {
         Box::<dyn error::Error + Send + Sync>::from(format!($($tt)*))
     }
+}
+
+/// Returns true if the system supports creating symbolic links.
+///
+/// On Windows, creating symlinks requires the `SeCreateSymbolicLinkPrivilege`
+/// or developer mode. On Unix, symlinks are generally always supported.
+///
+/// If symlinks are not supported, native symlink tests are skipped. The fake
+/// identity provider fixture (see `FakeIdentityProvider` in the recursive
+/// tests) provides an alternative way to test alias and loop handling without
+/// real symlinks.
+pub fn symlinks_supported() -> bool {
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = yes, 2 = no
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let supported = check_symlinks_supported();
+            STATE.store(if supported { 1 } else { 2 }, Ordering::Relaxed);
+            supported
+        }
+    }
+}
+
+fn check_symlinks_supported() -> bool {
+    let dir = match TempDir::new() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    if fs::create_dir(&target).is_err() {
+        return false;
+    }
+    symlink_dir_impl(&target, &link).is_ok()
+}
+
+#[cfg(windows)]
+fn symlink_dir_impl(src: &Path, link_name: &Path) -> io::Result<()> {
+    use std::os::windows::fs::symlink_dir;
+    symlink_dir(src, link_name)
+}
+
+#[cfg(unix)]
+fn symlink_dir_impl(src: &Path, link_name: &Path) -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+    symlink(src, link_name)
+}
+
+/// Skip the current test if the system does not support symbolic links.
+///
+/// Native symlink tests should use this at the start of the test. When
+/// symlinks are unsupported, the test is skipped and the fake identity
+/// provider fixture provides an alternative way to exercise the same logic.
+#[macro_export]
+macro_rules! skip_without_symlinks {
+    () => {
+        if !crate::tests::util::symlinks_supported() {
+            return;
+        }
+    };
 }
 
 /// A convenient result type alias.
