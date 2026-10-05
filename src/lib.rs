@@ -116,6 +116,7 @@ use std::io;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::Arc;
 use std::vec;
 
 use same_file::Handle;
@@ -123,10 +124,12 @@ use same_file::Handle;
 pub use crate::dent::DirEntry;
 #[cfg(unix)]
 pub use crate::dent::DirEntryExt;
-pub use crate::error::Error;
+pub use crate::error::{Error, ErrorStage};
+pub use crate::reader::{DirEntryStream, DirEnumerator};
 
 mod dent;
 mod error;
+mod reader;
 #[cfg(test)]
 mod tests;
 mod util;
@@ -252,6 +255,8 @@ struct WalkDirOptions {
     >,
     contents_first: bool,
     same_file_system: bool,
+    max_dir_retries: usize,
+    enumerator: Option<Arc<dyn DirEnumerator>>,
 }
 
 impl fmt::Debug for WalkDirOptions {
@@ -265,6 +270,8 @@ impl fmt::Debug for WalkDirOptions {
         } else {
             "None"
         };
+        let enumerator_str =
+            if self.enumerator.is_some() { "Some(...)" } else { "None" };
         f.debug_struct("WalkDirOptions")
             .field("follow_links", &self.follow_links)
             .field("follow_root_link", &self.follow_root_links)
@@ -274,6 +281,8 @@ impl fmt::Debug for WalkDirOptions {
             .field("sorter", &sorter_str)
             .field("contents_first", &self.contents_first)
             .field("same_file_system", &self.same_file_system)
+            .field("max_dir_retries", &self.max_dir_retries)
+            .field("enumerator", &enumerator_str)
             .finish()
     }
 }
@@ -297,6 +306,8 @@ impl WalkDir {
                 sorter: None,
                 contents_first: false,
                 same_file_system: false,
+                max_dir_retries: 0,
+                enumerator: None,
             },
             root: root.as_ref().to_path_buf(),
         }
@@ -531,6 +542,62 @@ impl WalkDir {
         self.opts.same_file_system = yes;
         self
     }
+
+    /// Set the maximum number of times enumerating a single directory may be
+    /// retried after a failure. By default, this is `0`, meaning no retries
+    /// are attempted and every enumeration error is yielded by the iterator
+    /// exactly once (the historical behavior).
+    ///
+    /// A retry is only ever attempted when the failed directory has not yet
+    /// produced any entries: either opening the directory failed, or reading
+    /// from it failed before the first entry was read. Note that an entry
+    /// counts as read as soon as it is fetched from the underlying directory
+    /// handle, even if it is later skipped (e.g. by [`min_depth`] or
+    /// [`filter_entry`]). Once at least one entry has been read from a
+    /// directory, a subsequent enumeration error for that directory is
+    /// marked as not retryable (see [`Error::is_retryable`]) and is yielded
+    /// as-is, since reopening the directory could deliver the same entry
+    /// twice.
+    ///
+    /// When a retry does happen, the old enumeration handle is closed before
+    /// the directory is reopened, and only the failed directory is reopened;
+    /// no other directory is rescanned. Each directory has its own retry
+    /// budget of `n` attempts.
+    ///
+    /// Errors yielded after the retry budget is exhausted still carry the
+    /// path of the directory and the [`ErrorStage`] at which the failure
+    /// occurred.
+    ///
+    /// [`min_depth`]: struct.WalkDir.html#method.min_depth
+    /// [`filter_entry`]: struct.IntoIter.html#method.filter_entry
+    /// [`Error::is_retryable`]: struct.Error.html#method.is_retryable
+    /// [`ErrorStage`]: enum.ErrorStage.html
+    pub fn max_dir_retries(mut self, n: usize) -> Self {
+        self.opts.max_dir_retries = n;
+        self
+    }
+
+    /// Inject a custom directory enumerator used to open and read directory
+    /// handles instead of [`std::fs::read_dir`].
+    ///
+    /// This is primarily useful for testing, e.g. to deterministically
+    /// inject enumeration failures and exercise the retry policy configured
+    /// with [`max_dir_retries`]. Entries yielded by the custom stream are
+    /// turned into [`DirEntry`] values with
+    /// [`std::fs::symlink_metadata`], so the paths yielded by the stream
+    /// should generally exist on disk.
+    ///
+    /// [`std::fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
+    /// [`std::fs::symlink_metadata`]: https://doc.rust-lang.org/stable/std/fs/fn.symlink_metadata.html
+    /// [`max_dir_retries`]: struct.WalkDir.html#method.max_dir_retries
+    /// [`DirEntry`]: struct.DirEntry.html
+    pub fn dir_enumerator<E>(mut self, enumerator: E) -> Self
+    where
+        E: DirEnumerator + 'static,
+    {
+        self.opts.enumerator = Some(Arc::new(enumerator));
+        self
+    }
 }
 
 impl IntoIterator for WalkDir {
@@ -651,29 +718,128 @@ impl Ancestor {
 /// A sequence of unconsumed directory entries.
 ///
 /// This represents the opened or closed state of a directory handle. When
-/// open, future entries are read by iterating over the raw `fs::ReadDir`.
-/// When closed, all future entries are read into memory. Iteration then
-/// proceeds over a [`Vec<fs::DirEntry>`].
+/// open, future entries are read by iterating over the raw `fs::ReadDir`
+/// (or an injected [`DirEntryStream`]). When closed, all future entries are
+/// read into memory. Iteration then proceeds over a
+/// [`Vec<fs::DirEntry>`].
 ///
+/// [`DirEntryStream`]: trait.DirEntryStream.html
 /// [`fs::ReadDir`]: https://doc.rust-lang.org/stable/std/fs/struct.ReadDir.html
 /// [`Vec<fs::DirEntry>`]: https://doc.rust-lang.org/stable/std/vec/struct.Vec.html
-#[derive(Debug)]
 enum DirList {
     /// An opened handle.
     ///
     /// This includes the depth of the handle itself.
     ///
-    /// If there was an error with the initial [`fs::read_dir`] call, then it
-    /// is stored here. (We use an [`Option<...>`] to make yielding the error
-    /// exactly once simpler.)
+    /// If there was an error with the initial open call, then it is stored
+    /// here. (We use an [`Option<...>`] to make yielding the error exactly
+    /// once simpler.)
     ///
-    /// [`fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
     /// [`Option<...>`]: https://doc.rust-lang.org/stable/std/option/enum.Option.html
-    Opened { depth: usize, it: result::Result<ReadDir, Option<Error>> },
+    Opened {
+        depth: usize,
+        /// The path of the directory being enumerated. Kept so that
+        /// enumeration errors can be associated with the directory and so
+        /// that the directory can be reopened when the retry policy allows
+        /// it.
+        path: PathBuf,
+        /// The enumerator used to (re)open this directory. When `None`, the
+        /// default [`fs::read_dir`] is used.
+        ///
+        /// [`fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
+        enumerator: Option<Arc<dyn DirEnumerator>>,
+        /// The current enumeration handle, or the as-of-yet unyielded error
+        /// from the last attempt to open the directory.
+        handle: result::Result<DirHandle, Option<Error>>,
+        /// The number of entries successfully read from the current handle.
+        /// This counts every entry fetched from the handle, including
+        /// entries that are later skipped by filters. Once this is non-zero,
+        /// enumeration errors for this directory are no longer retryable.
+        entries_read: usize,
+        /// The remaining retry budget for this directory.
+        retries_left: usize,
+    },
     /// A closed handle.
     ///
     /// All remaining directory entries are read into memory.
     Closed(vec::IntoIter<Result<DirEntry>>),
+}
+
+impl fmt::Debug for DirList {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> result::Result<(), fmt::Error> {
+        match *self {
+            DirList::Opened {
+                depth,
+                ref path,
+                entries_read,
+                retries_left,
+                ..
+            } => f
+                .debug_struct("Opened")
+                .field("depth", &depth)
+                .field("path", path)
+                .field("entries_read", &entries_read)
+                .field("retries_left", &retries_left)
+                .finish(),
+            DirList::Closed(_) => {
+                f.debug_tuple("Closed").field(&"...").finish()
+            }
+        }
+    }
+}
+
+/// An open enumeration handle for a single directory.
+///
+/// Dropping this closes the underlying OS handle.
+enum DirHandle {
+    /// The default handle, produced by [`fs::read_dir`].
+    ///
+    /// [`fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
+    Std(ReadDir),
+    /// A handle produced by an injected [`DirEnumerator`].
+    ///
+    /// [`DirEnumerator`]: trait.DirEnumerator.html
+    Custom(Box<dyn DirEntryStream>),
+}
+
+impl fmt::Debug for DirHandle {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> result::Result<(), fmt::Error> {
+        match *self {
+            DirHandle::Std(_) => f.debug_tuple("Std").field(&"...").finish(),
+            DirHandle::Custom(_) => {
+                f.debug_tuple("Custom").field(&"...").finish()
+            }
+        }
+    }
+}
+
+/// Open a new enumeration handle for the directory at `path`.
+fn open_dir_handle(
+    enumerator: &Option<Arc<dyn DirEnumerator>>,
+    path: &Path,
+    depth: usize,
+) -> result::Result<DirHandle, Option<Error>> {
+    let result = match *enumerator {
+        Some(ref enumerator) => enumerator.open(path).map(DirHandle::Custom),
+        None => fs::read_dir(path).map(DirHandle::Std),
+    };
+    result.map_err(|err| {
+        // Opening a directory can never have produced entries, so an open
+        // error is always safe to retry.
+        Some(Error::from_dir(
+            depth,
+            path.to_path_buf(),
+            err,
+            ErrorStage::OpenDir,
+            true,
+        ))
+    })
 }
 
 impl Iterator for IntoIter {
@@ -906,10 +1072,16 @@ impl IntoIter {
             self.stack_list[self.oldest_opened].close();
         }
         // Open a handle to reading the directory's entries.
-        let rd = fs::read_dir(dent.path()).map_err(|err| {
-            Some(Error::from_path(self.depth, dent.path().to_path_buf(), err))
-        });
-        let mut list = DirList::Opened { depth: self.depth, it: rd };
+        let path = dent.path().to_path_buf();
+        let handle = open_dir_handle(&self.opts.enumerator, &path, self.depth);
+        let mut list = DirList::Opened {
+            depth: self.depth,
+            path,
+            enumerator: self.opts.enumerator.clone(),
+            handle,
+            entries_read: 0,
+            retries_left: self.opts.max_dir_retries,
+        };
         if let Some(ref mut cmp) = self.opts.sorter {
             let mut entries: Vec<_> = list.collect();
             entries.sort_by(|a, b| match (a, b) {
@@ -1010,6 +1182,42 @@ impl DirList {
             *self = DirList::Closed(self.collect::<Vec<_>>().into_iter());
         }
     }
+
+    /// Close the current enumeration handle and open a fresh one for the
+    /// same directory.
+    ///
+    /// The old handle is always closed (dropped) before the new one is
+    /// opened, and only this directory is reopened; no other directory on
+    /// the stack is touched. This must only be called when no entries have
+    /// been read from the current handle, so that no entry can be delivered
+    /// twice.
+    fn reopen(&mut self) {
+        if let DirList::Opened {
+            depth,
+            ref path,
+            ref enumerator,
+            ref mut handle,
+            ref mut entries_read,
+            ..
+        } = *self
+        {
+            // Close the old enumeration handle first, then open a new one.
+            *handle = Err(None);
+            *entries_read = 0;
+            *handle = open_dir_handle(enumerator, path, depth);
+        }
+    }
+}
+
+/// The outcome of a single poll of a [`DirList`].
+///
+/// [`DirList`]: enum.DirList.html
+enum DirListStep {
+    /// Yield this item to the caller.
+    Item(Result<DirEntry>),
+    /// The current handle failed before producing any entries and the retry
+    /// policy allows reopening the directory.
+    Retry,
 }
 
 impl Iterator for DirList {
@@ -1017,15 +1225,95 @@ impl Iterator for DirList {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Result<DirEntry>> {
-        match *self {
-            DirList::Closed(ref mut it) => it.next(),
-            DirList::Opened { depth, ref mut it } => match *it {
-                Err(ref mut err) => err.take().map(Err),
-                Ok(ref mut rd) => rd.next().map(|r| match r {
-                    Ok(r) => DirEntry::from_entry(depth + 1, &r),
-                    Err(err) => Err(Error::from_io(depth + 1, err)),
-                }),
-            },
+        loop {
+            let step = match *self {
+                DirList::Closed(ref mut it) => return it.next(),
+                DirList::Opened {
+                    depth,
+                    ref path,
+                    ref mut handle,
+                    ref mut entries_read,
+                    ref mut retries_left,
+                    ..
+                } => {
+                    match *handle {
+                        Err(ref mut pending) => match pending.take() {
+                            // The open error was already yielded (and no
+                            // retry is possible), so this directory is done.
+                            None => return None,
+                            Some(err) => {
+                                if err.is_retryable() && *retries_left > 0 {
+                                    *retries_left -= 1;
+                                    DirListStep::Retry
+                                } else {
+                                    DirListStep::Item(Err(err))
+                                }
+                            }
+                        },
+                        Ok(ref mut handle) => {
+                            let next = match *handle {
+                                DirHandle::Std(ref mut rd) => {
+                                    rd.next().map(|r| match r {
+                                        Ok(ent) => Ok(Ok(ent)),
+                                        Err(err) => Err(err),
+                                    })
+                                }
+                                DirHandle::Custom(ref mut stream) => {
+                                    stream.next_entry().map(|r| match r {
+                                        Ok(path) => Ok(Err(path)),
+                                        Err(err) => Err(err),
+                                    })
+                                }
+                            };
+                            match next {
+                                None => return None,
+                                Some(Ok(Ok(ent))) => {
+                                    *entries_read += 1;
+                                    DirListStep::Item(DirEntry::from_entry(
+                                        depth + 1,
+                                        &ent,
+                                    ))
+                                }
+                                Some(Ok(Err(entry_path))) => {
+                                    *entries_read += 1;
+                                    DirListStep::Item(DirEntry::from_path(
+                                        depth + 1,
+                                        entry_path,
+                                        false,
+                                    ))
+                                }
+                                Some(Err(err)) => {
+                                    // An enumeration error is only safe to
+                                    // retry if no entry has been read from
+                                    // this handle yet. Once any entry has
+                                    // been read (even one that is later
+                                    // filtered out), reopening could deliver
+                                    // it twice, so the error is explicitly
+                                    // marked as not retryable.
+                                    let retryable = *entries_read == 0;
+                                    let err = Error::from_dir(
+                                        depth + 1,
+                                        path.clone(),
+                                        err,
+                                        ErrorStage::ReadDir,
+                                        retryable,
+                                    );
+                                    if retryable && *retries_left > 0 {
+                                        *retries_left -= 1;
+                                        DirListStep::Retry
+                                    } else {
+                                        DirListStep::Item(Err(err))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            match step {
+                DirListStep::Item(item) => return Some(item),
+                DirListStep::Retry => self.reopen(),
+            }
         }
     }
 }

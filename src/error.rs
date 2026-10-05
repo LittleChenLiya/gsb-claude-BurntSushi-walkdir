@@ -28,6 +28,31 @@ use crate::DirEntry;
 pub struct Error {
     depth: usize,
     inner: ErrorInner,
+    /// The directory traversal stage at which this error occurred, if the
+    /// error is tied to enumerating a particular directory.
+    stage: Option<ErrorStage>,
+    /// Whether it is safe to retry the failed operation by reopening the
+    /// directory. This is only ever `true` for directory enumeration errors
+    /// that occurred before any entry was read from that directory, so that
+    /// retrying can never deliver the same entry twice.
+    retryable: bool,
+}
+
+/// The stage of directory traversal at which an [`Error`] occurred.
+///
+/// This is only set for errors that are tied to enumerating the contents of
+/// a particular directory. The path of that directory is available via
+/// [`Error::path`].
+///
+/// [`Error`]: struct.Error.html
+/// [`Error::path`]: struct.Error.html#method.path
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorStage {
+    /// The error occurred while opening a directory for reading.
+    OpenDir,
+    /// The error occurred while reading entries from an already open
+    /// directory handle.
+    ReadDir,
 }
 
 #[derive(Debug)]
@@ -80,6 +105,38 @@ impl Error {
     /// [`WalkDir`]: struct.WalkDir.html
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Returns the directory traversal stage at which this error occurred.
+    ///
+    /// This is only `Some(...)` for errors that are tied to enumerating the
+    /// contents of a particular directory (opening it or reading entries
+    /// from it). In that case, [`path`] returns the path of that directory.
+    /// For all other errors, [`None`] is returned.
+    ///
+    /// [`None`]: https://doc.rust-lang.org/stable/std/option/enum.Option.html#variant.None
+    /// [`path`]: struct.Error.html#method.path
+    pub fn stage(&self) -> Option<ErrorStage> {
+        self.stage
+    }
+
+    /// Returns true if and only if this error is safe to retry by reopening
+    /// the directory that failed.
+    ///
+    /// An error is only retryable when it occurred while enumerating a
+    /// directory from which no entries had been read yet (including entries
+    /// that were read but later filtered out). Once at least one entry has
+    /// been read from a directory, any subsequent enumeration error for that
+    /// directory is explicitly marked as not retryable, since reopening the
+    /// directory could deliver the same entry twice.
+    ///
+    /// Note that this only describes whether a retry *could* be safe. Whether
+    /// retries are actually attempted is controlled by
+    /// [`WalkDir::max_dir_retries`].
+    ///
+    /// [`WalkDir::max_dir_retries`]: struct.WalkDir.html#method.max_dir_retries
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
     }
 
     /// Inspect the original [`io::Error`] if there is one.
@@ -164,7 +221,12 @@ impl Error {
         pb: PathBuf,
         err: io::Error,
     ) -> Self {
-        Error { depth, inner: ErrorInner::Io { path: Some(pb), err } }
+        Error {
+            depth,
+            inner: ErrorInner::Io { path: Some(pb), err },
+            stage: None,
+            retryable: false,
+        }
     }
 
     pub(crate) fn from_entry(dent: &DirEntry, err: io::Error) -> Self {
@@ -174,11 +236,18 @@ impl Error {
                 path: Some(dent.path().to_path_buf()),
                 err,
             },
+            stage: None,
+            retryable: false,
         }
     }
 
     pub(crate) fn from_io(depth: usize, err: io::Error) -> Self {
-        Error { depth, inner: ErrorInner::Io { path: None, err } }
+        Error {
+            depth,
+            inner: ErrorInner::Io { path: None, err },
+            stage: None,
+            retryable: false,
+        }
     }
 
     pub(crate) fn from_loop(
@@ -192,6 +261,29 @@ impl Error {
                 ancestor: ancestor.to_path_buf(),
                 child: child.to_path_buf(),
             },
+            stage: None,
+            retryable: false,
+        }
+    }
+
+    /// Create an error tied to enumerating the directory at `path`.
+    ///
+    /// `stage` records whether the failure happened while opening the
+    /// directory or while reading entries from it, and `retryable` records
+    /// whether reopening the directory could ever be safe (i.e. no entries
+    /// had been read from it yet).
+    pub(crate) fn from_dir(
+        depth: usize,
+        pb: PathBuf,
+        err: io::Error,
+        stage: ErrorStage,
+        retryable: bool,
+    ) -> Self {
+        Error {
+            depth,
+            inner: ErrorInner::Io { path: Some(pb), err },
+            stage: Some(stage),
+            retryable,
         }
     }
 }
