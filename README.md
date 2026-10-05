@@ -85,6 +85,37 @@ for entry in walker.filter_entry(|e| !is_hidden(e)) {
 }
 ```
 
+### Example: explicit enter/leave events
+
+If you need to know when a directory is entered and left (instead of
+inferring boundaries from the depth), use the `walk_events` API. It yields
+explicit `Enter`, `Entry` and `Leave` events, and each `Leave` carries a
+reason (`Completed`, `ReadFailed`, `Skipped`, `Cancelled` or `Incomplete`):
+
+```rust,no_run
+use walkdir::{walk_events, Event};
+
+for result in walk_events("foo") {
+    match result.unwrap() {
+        Event::Enter { dir } => {
+            println!("enter {}", dir.path().display());
+        }
+        Event::Entry { entry } => {
+            println!("entry {}", entry.path().display());
+        }
+        Event::Leave { dir, reason } => {
+            println!("leave {} ({:?})", dir.path().display(), reason);
+        }
+        _ => {}
+    }
+}
+```
+
+The ordinary `WalkDir` iterator is unchanged. Directory and file filtering
+are configured separately with `filter_dirs` and `filter_files`, an open
+directory can be pruned with `skip_current_dir`, and `cancel` closes every
+still-open directory with an explicit `Cancelled` leave.
+
 ### Minimum Rust version policy
 
 This crate's minimum supported `rustc` version is `1.60.0`.

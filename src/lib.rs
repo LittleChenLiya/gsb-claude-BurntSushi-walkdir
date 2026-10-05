@@ -20,6 +20,14 @@ yielded by the iterator. Finally, the [`Error`] type is a small wrapper around
 [`std::io::Error`] with additional information, such as if a loop was detected
 while following symbolic links (not enabled by default).
 
+If you need directory boundaries to be explicit instead of inferred from the
+depth, the [`events`](events/index.html) module provides a parallel
+[`walk_events`](fn.walk_events.html) API that emits paired
+[`Enter`](events/enum.Event.html#variant.Enter) and
+[`Leave`](events/enum.Event.html#variant.Leave) events (with a precise
+[`LeaveReason`](events/enum.LeaveReason.html)) alongside ordinary
+[`Entry`](events/enum.Event.html#variant.Entry) events.
+
 [`WalkDir`]: struct.WalkDir.html
 [`DirEntry`]: struct.DirEntry.html
 [`Error`]: struct.Error.html
@@ -124,9 +132,13 @@ pub use crate::dent::DirEntry;
 #[cfg(unix)]
 pub use crate::dent::DirEntryExt;
 pub use crate::error::Error;
+pub use crate::events::{
+    walk_events, Completion, Event, EventIter, LeaveReason, WalkEvents,
+};
 
 mod dent;
 mod error;
+mod events;
 #[cfg(test)]
 mod tests;
 mod util;
