@@ -1,0 +1,17 @@
+# Local cargo commands for working on walkdir.
+#
+# Run these with `cargo <alias>` from the repository root.
+
+[alias]
+# Build the library and binaries.
+b = "build"
+# Run all library tests (excludes symlink tests that need privileges).
+t = "test --lib"
+# Run only the retry policy tests.
+tr = "test --lib retry"
+# Check the library for errors without building.
+c = "check --lib"
+# Build the documentation.
+d = "doc --no-deps"
+# Run the walkdir-list binary.
+wl = "run -p walkdir-bin --"

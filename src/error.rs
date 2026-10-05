@@ -5,6 +5,25 @@ use std::path::{Path, PathBuf};
 
 use crate::DirEntry;
 
+/// The stage of directory enumeration at which an [`Error`] occurred.
+///
+/// This is used to distinguish an error that happened while *opening* a
+/// directory handle from an error that happened while *reading* entries
+/// from an already open handle. The distinction matters for the directory
+/// retry policy: an error while reading is only retryable if no entry has
+/// been successfully read from the directory yet.
+///
+/// [`Error`]: struct.Error.html
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorStage {
+    /// The error occurred while opening the directory handle, e.g. the
+    /// underlying `read_dir` call failed.
+    Open,
+    /// The error occurred while reading an entry from an open directory
+    /// handle, e.g. the underlying iterator returned an error.
+    Read,
+}
+
 /// An error produced by recursively walking a directory.
 ///
 /// This error type is a light wrapper around [`std::io::Error`]. In
@@ -13,6 +32,12 @@ use crate::DirEntry;
 /// * The depth at which the error occurred in the file tree, relative to the
 /// root.
 /// * The path, if any, associated with the IO error.
+/// * The stage of directory enumeration at which the error occurred (opening
+/// the handle or reading an entry from it).
+/// * Whether the error is retryable. An error is retryable only if no entry
+/// has been successfully read from the directory yet; once an entry has been
+/// delivered, the directory cannot be reopened without risking duplicate
+/// delivery.
 /// * An indication that a loop occurred when following symbolic links. In this
 /// case, there is no underlying IO error.
 ///
@@ -32,8 +57,16 @@ pub struct Error {
 
 #[derive(Debug)]
 enum ErrorInner {
-    Io { path: Option<PathBuf>, err: io::Error },
-    Loop { ancestor: PathBuf, child: PathBuf },
+    Io {
+        path: Option<PathBuf>,
+        stage: ErrorStage,
+        retryable: bool,
+        err: io::Error,
+    },
+    Loop {
+        ancestor: PathBuf,
+        child: PathBuf,
+    },
 }
 
 impl Error {
@@ -80,6 +113,37 @@ impl Error {
     /// [`WalkDir`]: struct.WalkDir.html
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Returns the stage of directory enumeration at which this error
+    /// occurred, if the error is an IO error.
+    ///
+    /// [`None`] is returned for errors that do not correspond to a directory
+    /// enumeration stage, such as a loop detected while following symbolic
+    /// links.
+    ///
+    /// [`None`]: https://doc.rust-lang.org/stable/std/option/enum.Option.html#variant.None
+    pub fn stage(&self) -> Option<ErrorStage> {
+        match self.inner {
+            ErrorInner::Io { stage, .. } => Some(stage),
+            ErrorInner::Loop { .. } => None,
+        }
+    }
+
+    /// Returns whether this error is retryable.
+    ///
+    /// An error is retryable if it occurred while opening a directory handle,
+    /// or while reading an entry from a directory from which no entry has been
+    /// successfully read yet. Once at least one entry has been read from a
+    /// directory, any subsequent read error is non-retryable, because
+    /// reopening the directory would deliver duplicate entries.
+    ///
+    /// Loop errors are never retryable.
+    pub fn is_retryable(&self) -> bool {
+        match self.inner {
+            ErrorInner::Io { retryable, .. } => retryable,
+            ErrorInner::Loop { .. } => false,
+        }
     }
 
     /// Inspect the original [`io::Error`] if there is one.
@@ -164,7 +228,15 @@ impl Error {
         pb: PathBuf,
         err: io::Error,
     ) -> Self {
-        Error { depth, inner: ErrorInner::Io { path: Some(pb), err } }
+        Error {
+            depth,
+            inner: ErrorInner::Io {
+                path: Some(pb),
+                stage: ErrorStage::Read,
+                retryable: false,
+                err,
+            },
+        }
     }
 
     pub(crate) fn from_entry(dent: &DirEntry, err: io::Error) -> Self {
@@ -172,13 +244,62 @@ impl Error {
             depth: dent.depth(),
             inner: ErrorInner::Io {
                 path: Some(dent.path().to_path_buf()),
+                stage: ErrorStage::Read,
+                retryable: false,
                 err,
             },
         }
     }
 
     pub(crate) fn from_io(depth: usize, err: io::Error) -> Self {
-        Error { depth, inner: ErrorInner::Io { path: None, err } }
+        Error {
+            depth,
+            inner: ErrorInner::Io {
+                path: None,
+                stage: ErrorStage::Read,
+                retryable: false,
+                err,
+            },
+        }
+    }
+
+    /// Create an error for a failure while opening a directory handle.
+    ///
+    /// Open errors are always retryable in nature (no entry has been read
+    /// from the directory yet).
+    pub(crate) fn open(depth: usize, path: PathBuf, err: io::Error) -> Self {
+        Error {
+            depth,
+            inner: ErrorInner::Io {
+                path: Some(path),
+                stage: ErrorStage::Open,
+                retryable: true,
+                err,
+            },
+        }
+    }
+
+    /// Create an error for a failure while reading an entry from an open
+    /// directory handle.
+    ///
+    /// `retryable` should be `true` only if no entry has been successfully
+    /// read from the directory yet; once an entry has been read, the error
+    /// is non-retryable to avoid duplicate delivery.
+    pub(crate) fn read(
+        depth: usize,
+        path: PathBuf,
+        retryable: bool,
+        err: io::Error,
+    ) -> Self {
+        Error {
+            depth,
+            inner: ErrorInner::Io {
+                path: Some(path),
+                stage: ErrorStage::Read,
+                retryable,
+                err,
+            },
+        }
     }
 
     pub(crate) fn from_loop(
@@ -220,8 +341,8 @@ impl error::Error for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.inner {
-            ErrorInner::Io { path: None, ref err } => err.fmt(f),
-            ErrorInner::Io { path: Some(ref path), ref err } => write!(
+            ErrorInner::Io { path: None, ref err, .. } => err.fmt(f),
+            ErrorInner::Io { path: Some(ref path), ref err, .. } => write!(
                 f,
                 "IO error for operation on {}: {}",
                 path.display(),

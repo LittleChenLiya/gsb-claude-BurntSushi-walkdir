@@ -116,6 +116,7 @@ use std::io;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::result;
+use std::sync::Arc;
 use std::vec;
 
 use same_file::Handle;
@@ -123,13 +124,37 @@ use same_file::Handle;
 pub use crate::dent::DirEntry;
 #[cfg(unix)]
 pub use crate::dent::DirEntryExt;
-pub use crate::error::Error;
+pub use crate::error::{Error, ErrorStage};
 
 mod dent;
 mod error;
 #[cfg(test)]
 mod tests;
 mod util;
+
+/// A trait for opening a directory handle.
+///
+/// This abstracts [`std::fs::read_dir`] so that the directory retry logic can
+/// be tested with an injected opener that fails deterministically.
+///
+/// [`std::fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
+pub(crate) trait DirOpener: Send + Sync {
+    /// Open a handle to reading the directory at `path`.
+    fn open(&self, path: &Path) -> io::Result<Box<dyn DirReader>>;
+}
+
+/// A trait for reading entries from an open directory handle.
+///
+/// This abstracts [`std::fs::ReadDir`] so that the directory retry logic can
+/// be tested with an injected reader that fails deterministically.
+///
+/// [`std::fs::ReadDir`]: https://doc.rust-lang.org/stable/std/fs/struct.ReadDir.html
+pub(crate) trait DirReader:
+    Iterator<Item = io::Result<fs::DirEntry>> + Send + Sync
+{
+}
+
+impl DirReader for ReadDir {}
 
 /// Like try, but for iterators that return [`Option<Result<_, _>>`].
 ///
@@ -236,6 +261,19 @@ pub struct WalkDir {
     root: PathBuf,
 }
 
+/// The default [`DirOpener`], which delegates to [`std::fs::read_dir`].
+///
+/// [`DirOpener`]: trait.DirOpener.html
+/// [`std::fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
+#[derive(Debug)]
+pub(crate) struct RealOpener;
+
+impl DirOpener for RealOpener {
+    fn open(&self, path: &Path) -> io::Result<Box<dyn DirReader>> {
+        fs::read_dir(path).map(|rd| Box::new(rd) as Box<dyn DirReader>)
+    }
+}
+
 struct WalkDirOptions {
     follow_links: bool,
     follow_root_links: bool,
@@ -252,6 +290,8 @@ struct WalkDirOptions {
     >,
     contents_first: bool,
     same_file_system: bool,
+    max_retries: usize,
+    opener: Arc<dyn DirOpener>,
 }
 
 impl fmt::Debug for WalkDirOptions {
@@ -274,6 +314,8 @@ impl fmt::Debug for WalkDirOptions {
             .field("sorter", &sorter_str)
             .field("contents_first", &self.contents_first)
             .field("same_file_system", &self.same_file_system)
+            .field("max_retries", &self.max_retries)
+            .field("opener", &"...")
             .finish()
     }
 }
@@ -297,6 +339,8 @@ impl WalkDir {
                 sorter: None,
                 contents_first: false,
                 same_file_system: false,
+                max_retries: 0,
+                opener: Arc::new(RealOpener),
             },
             root: root.as_ref().to_path_buf(),
         }
@@ -531,6 +575,61 @@ impl WalkDir {
         self.opts.same_file_system = yes;
         self
     }
+
+    /// Set the maximum number of times a failed directory operation is
+    /// retried.
+    ///
+    /// When `max_retries` is `0` (the default), no retries are attempted: the
+    /// first error encountered is yielded by the iterator, exactly as it was
+    /// before this option existed.
+    ///
+    /// When `max_retries` is greater than `0`, the iterator will retry a
+    /// failed directory operation up to `max_retries` times before yielding
+    /// the error. Retries are only attempted under the following
+    /// circumstances:
+    ///
+    /// * **Opening the directory fails.** The directory handle is reopened.
+    /// * **Reading the first entry from the directory fails.** No entry has
+    ///   been delivered yet, so the old handle is closed and the directory is
+    ///   reopened.
+    ///
+    /// Once at least one entry has been successfully read from a directory,
+    /// any subsequent read error is **not** retried. This avoids delivering
+    /// duplicate entries: reopening the directory would restart enumeration
+    /// from the beginning. Such errors are marked as non-retryable via
+    /// [`Error::is_retryable`].
+    ///
+    /// Only the directory that failed is retried. Other directories on the
+    /// stack are not rescanned. When retrying a read failure, the old
+    /// directory handle is closed (dropped) before the directory is
+    /// reopened.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use walkdir::WalkDir;
+    ///
+    /// for entry in WalkDir::new("foo").retry_on_error(3) {
+    ///     let entry = entry?;
+    ///     println!("{}", entry.path().display());
+    /// }
+    /// # Ok::<(), walkdir::Error>(())
+    /// ```
+    ///
+    /// [`Error::is_retryable`]: struct.Error.html#method.is_retryable
+    pub fn retry_on_error(mut self, max_retries: usize) -> Self {
+        self.opts.max_retries = max_retries;
+        self
+    }
+
+    /// Replace the directory opener.
+    ///
+    /// This is used by tests to inject an opener that fails deterministically.
+    #[cfg(test)]
+    pub(crate) fn with_opener(mut self, opener: Arc<dyn DirOpener>) -> Self {
+        self.opts.opener = opener;
+        self
+    }
 }
 
 impl IntoIterator for WalkDir {
@@ -661,19 +760,53 @@ impl Ancestor {
 enum DirList {
     /// An opened handle.
     ///
-    /// This includes the depth of the handle itself.
-    ///
-    /// If there was an error with the initial [`fs::read_dir`] call, then it
-    /// is stored here. (We use an [`Option<...>`] to make yielding the error
-    /// exactly once simpler.)
-    ///
-    /// [`fs::read_dir`]: https://doc.rust-lang.org/stable/std/fs/fn.read_dir.html
-    /// [`Option<...>`]: https://doc.rust-lang.org/stable/std/option/enum.Option.html
-    Opened { depth: usize, it: result::Result<ReadDir, Option<Error>> },
+    /// This includes the depth of the handle itself, the path being read,
+    /// and the state needed to enforce the directory retry policy.
+    Opened(OpenDir),
     /// A closed handle.
     ///
     /// All remaining directory entries are read into memory.
     Closed(vec::IntoIter<Result<DirEntry>>),
+}
+
+/// The state of an open directory handle.
+///
+/// This tracks the underlying reader along with the state needed to enforce
+/// the directory retry policy: a retry is only permitted before any entry
+/// has been successfully read from the directory.
+struct OpenDir {
+    /// The depth of the directory itself (entries are at `depth + 1`).
+    depth: usize,
+    /// The path of the directory being read.
+    path: PathBuf,
+    /// The underlying reader. This is `None` once the directory has been
+    /// exhausted or a terminal error has been yielded.
+    reader: Option<Box<dyn DirReader>>,
+    /// Whether at least one entry has been successfully read from this
+    /// directory. Once `true`, any subsequent read error is non-retryable.
+    read_any: bool,
+    /// The number of retries attempted so far.
+    attempts: usize,
+    /// The maximum number of retries permitted.
+    max_retries: usize,
+    /// The opener used to reopen the directory when a retry is permitted.
+    opener: Arc<dyn DirOpener>,
+}
+
+impl fmt::Debug for OpenDir {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> result::Result<(), fmt::Error> {
+        f.debug_struct("OpenDir")
+            .field("depth", &self.depth)
+            .field("path", &self.path)
+            .field("reader", &self.reader.is_some())
+            .field("read_any", &self.read_any)
+            .field("attempts", &self.attempts)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
 }
 
 impl Iterator for IntoIter {
@@ -905,11 +1038,19 @@ impl IntoIter {
         if free == self.opts.max_open {
             self.stack_list[self.oldest_opened].close();
         }
-        // Open a handle to reading the directory's entries.
-        let rd = fs::read_dir(dent.path()).map_err(|err| {
-            Some(Error::from_path(self.depth, dent.path().to_path_buf(), err))
+        // Open a handle to reading the directory's entries, retrying according
+        // to the directory retry policy.
+        let path = dent.path().to_path_buf();
+        let reader = self.open_dir(&path)?;
+        let mut list = DirList::Opened(OpenDir {
+            depth: self.depth,
+            path,
+            reader: Some(reader),
+            read_any: false,
+            attempts: 0,
+            max_retries: self.opts.max_retries,
+            opener: self.opts.opener.clone(),
         });
-        let mut list = DirList::Opened { depth: self.depth, it: rd };
         if let Some(ref mut cmp) = self.opts.sorter {
             let mut entries: Vec<_> = list.collect();
             entries.sort_by(|a, b| match (a, b) {
@@ -945,6 +1086,31 @@ impl IntoIter {
             self.oldest_opened = self.oldest_opened.checked_add(1).unwrap();
         }
         Ok(())
+    }
+
+    /// Open a handle to reading the directory at `path`, retrying according to
+    /// the directory retry policy.
+    ///
+    /// Each failed open attempt consumes one retry. Once the retry budget is
+    /// exhausted, the error is returned with [`ErrorStage::Open`].
+    fn open_dir(&self, path: &Path) -> Result<Box<dyn DirReader>> {
+        let mut attempts = 0;
+        loop {
+            match self.opts.opener.open(path) {
+                Ok(reader) => return Ok(reader),
+                Err(err) => {
+                    if attempts < self.opts.max_retries {
+                        attempts += 1;
+                        continue;
+                    }
+                    return Err(Error::open(
+                        self.depth,
+                        path.to_path_buf(),
+                        err,
+                    ));
+                }
+            }
+        }
     }
 
     fn pop(&mut self) {
@@ -1006,8 +1172,87 @@ impl iter::FusedIterator for IntoIter {}
 
 impl DirList {
     fn close(&mut self) {
-        if let DirList::Opened { .. } = *self {
-            *self = DirList::Closed(self.collect::<Vec<_>>().into_iter());
+        if let DirList::Opened(ref mut od) = *self {
+            let depth = od.depth;
+            let path = od.path.clone();
+            let read_any = od.read_any;
+            // Collect the remaining entries into memory without retrying. The
+            // purpose of closing is to free a file descriptor, and reopening
+            // the directory here would keep the descriptor open. In practice
+            // a directory is only closed after at least one entry has been
+            // read from it, so no retry is permitted anyway.
+            let entries: Vec<_> = od
+                .reader
+                .take()
+                .into_iter()
+                .flatten()
+                .map(|r| match r {
+                    Ok(r) => DirEntry::from_entry(depth + 1, &r),
+                    Err(err) => {
+                        Err(Error::read(depth + 1, path.clone(), !read_any, err))
+                    }
+                })
+                .collect();
+            *self = DirList::Closed(entries.into_iter());
+        }
+    }
+}
+
+impl Iterator for OpenDir {
+    type Item = Result<DirEntry>;
+
+    fn next(&mut self) -> Option<Result<DirEntry>> {
+        loop {
+            // Read the next item from the current reader. The borrow of
+            // `self.reader` ends with this block, so we are free to mutate
+            // `self.reader` (e.g. drop it before reopening) below.
+            let read_result = {
+                let reader = match self.reader {
+                    Some(ref mut r) => r,
+                    None => return None,
+                };
+                reader.next()
+            };
+            match read_result {
+                None => return None,
+                Some(Ok(r)) => {
+                    self.read_any = true;
+                    return Some(DirEntry::from_entry(self.depth + 1, &r));
+                }
+                Some(Err(err)) => {
+                    if self.read_any || self.attempts >= self.max_retries {
+                        // Either an entry has already been delivered (so a
+                        // reopen would duplicate entries) or the retry budget
+                        // is exhausted. Yield the error and stop.
+                        self.reader = None;
+                        return Some(Err(Error::read(
+                            self.depth + 1,
+                            self.path.clone(),
+                            !self.read_any,
+                            err,
+                        )));
+                    }
+                    // No entry has been read yet and retries remain. Close the
+                    // old handle before reopening the directory.
+                    self.reader = None;
+                    self.attempts += 1;
+                    match self.opener.open(&self.path) {
+                        Ok(new_reader) => {
+                            self.reader = Some(new_reader);
+                            // Loop to read from the reopened handle.
+                        }
+                        Err(open_err) => {
+                            // Reopening failed. Yield the open error and stop.
+                            self.reader = None;
+                            return Some(Err(Error::open(
+                                self.depth,
+                                self.path.clone(),
+                                open_err,
+                            )));
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1019,13 +1264,7 @@ impl Iterator for DirList {
     fn next(&mut self) -> Option<Result<DirEntry>> {
         match *self {
             DirList::Closed(ref mut it) => it.next(),
-            DirList::Opened { depth, ref mut it } => match *it {
-                Err(ref mut err) => err.take().map(Err),
-                Ok(ref mut rd) => rd.next().map(|r| match r {
-                    Ok(r) => DirEntry::from_entry(depth + 1, &r),
-                    Err(err) => Err(Error::from_io(depth + 1, err)),
-                }),
-            },
+            DirList::Opened(ref mut od) => od.next(),
         }
     }
 }
