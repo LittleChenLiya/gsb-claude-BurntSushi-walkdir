@@ -124,9 +124,11 @@ pub use crate::dent::DirEntry;
 #[cfg(unix)]
 pub use crate::dent::DirEntryExt;
 pub use crate::error::Error;
+pub use crate::events::{LeaveReason, WalkControl, WalkEvent};
 
 mod dent;
 mod error;
+mod events;
 #[cfg(test)]
 mod tests;
 mod util;
